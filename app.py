@@ -1,38 +1,29 @@
-
 from flask import Flask, request, jsonify
+from pymongo import MongoClient
+from bson.json_util import dumps
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 from datetime import datetime
 import os
-import json
+from collections import Counter
 
 app = Flask(__name__)
 
-ARCHIVO_PEDIDOS = "pedidos_guardados.json"
-ARCHIVO_CONTADOR = "id_counter.json"
+# Conexión a MongoDB Atlas
+client = MongoClient(os.environ.get("MONGO_CLIENT"))
+db = client[os.environ.get("MONGO_DB")]
+pedidos_collection = db[os.environ.get("MONGO_PEDIDOS_COLLECTION")]
+contador_collection = db[os.environ.get("MONGO_CONTADOR_COLLECTION")]
 
-if os.path.exists(ARCHIVO_PEDIDOS):
-    with open(ARCHIVO_PEDIDOS, "r", encoding="utf-8") as f:
-        pedidos_guardados = json.load(f)
-else:
-    pedidos_guardados = []
-
-if os.path.exists(ARCHIVO_CONTADOR):
-    with open(ARCHIVO_CONTADOR, "r", encoding="utf-8") as f:
-        contador = json.load(f)["ultimo_id"]
-else:
-    contador = 0
-
-def guardar_en_archivo():
-    with open(ARCHIVO_PEDIDOS, "w", encoding="utf-8") as f:
-        json.dump(pedidos_guardados, f, indent=2, ensure_ascii=False)
-    with open(ARCHIVO_CONTADOR, "w", encoding="utf-8") as f:
-        json.dump({"ultimo_id": contador}, f)
-
+# Generar ID numérico incremental persistente
 def generar_id_numerico():
-    global contador
-    contador += 1
-    return contador
+    result = contador_collection.find_one_and_update(
+        {"_id": "contador_pedidos"},
+        {"$inc": {"valor": 1}},
+        upsert=True,
+        return_document=True
+    )
+    return result["valor"]
 
 def enviar_mensaje_whatsapp(telefono, mensaje):
     try:
@@ -50,55 +41,54 @@ def enviar_mensaje_whatsapp(telefono, mensaje):
 
 @app.route("/api/pedidos", methods=["GET"])
 def obtener_pedidos():
-    print("Contenido actual:", pedidos_guardados)
-    return jsonify(pedidos_guardados)
+    pedidos = list(pedidos_collection.find())
+    return dumps(pedidos), 200
 
+@app.route("/api/pedidos", methods=["POST"])
+def crear_pedido():
+    data = request.get_json()
+    data["id"] = generar_id_numerico()
+    data["timestamp"] = datetime.now().isoformat()
+    pedidos_collection.insert_one(data)
+    return jsonify({"mensaje": "Pedido creado", "pedido": data}), 201
 
 @app.route("/api/pedidos/<int:id_pedido>", methods=["PUT"])
 def actualizar_pedido(id_pedido):
     datos = request.get_json()
-    for pedido in pedidos_guardados:
-        if pedido.get("id") == id_pedido:
-            pedido.update(datos)
-            pedido["timestamp"] = datetime.now().isoformat()
-            guardar_en_archivo()
-            # Enviar mensaje si se actualizó el estado
-            if "estado" in datos and "telefono" in pedido:
-                estado = datos["estado"]
-                mensaje = {
-                    "pendiente": "🕒 Tu pedido ha sido recibido.",
-                    "en_preparacion": "👨‍🍳 Tu pedido está en preparación.",
-                    "preparado": "✅ Tu pedido ya está listo para recoger.",
-                    "entregado": "🚚 Tu pedido ha sido entregado. ¡Gracias!"
-                }.get(estado, None)
-                if mensaje:
-                    enviar_mensaje_whatsapp(pedido["telefono"], mensaje)
-            return jsonify({"mensaje": "Pedido actualizado", "pedido": pedido})
+    datos["timestamp"] = datetime.now().isoformat()
+    resultado = pedidos_collection.find_one_and_update(
+        {"id": id_pedido},
+        {"$set": datos},
+        return_document=True
+    )
+    if resultado:
+        # Enviar mensaje si se actualizó el estado
+        if "estado" in datos and "telefono" in resultado:
+            mensaje = {
+                "pendiente": "🕒 Tu pedido ha sido recibido.",
+                "en_preparacion": "👨‍🍳 Tu pedido está en preparación.",
+                "preparado": "✅ Tu pedido ya está listo para recoger.",
+                "entregado": "🚚 Tu pedido ha sido entregado. ¡Gracias!"
+            }.get(datos["estado"], None)
+            if mensaje:
+                enviar_mensaje_whatsapp(resultado["telefono"], mensaje)
+        return jsonify({"mensaje": "Pedido actualizado", "pedido": resultado})
     return jsonify({"error": "Pedido no encontrado"}), 404
 
 @app.route("/api/pedidos/<int:id_pedido>", methods=["DELETE"])
 def eliminar_pedido(id_pedido):
-    global pedidos_guardados
-    pedido = next((p for p in pedidos_guardados if p.get("id") == id_pedido), None)
+    pedido = pedidos_collection.find_one({"id": id_pedido})
     if pedido:
         telefono = pedido.get("telefono")
         tipo = pedido.get("tipo")
         mensaje = "🛑 Tu reserva ha sido cancelada." if tipo == "reserva" else "🛑 Tu pedido ha sido cancelado."
         if telefono:
             enviar_mensaje_whatsapp(telefono, mensaje)
-    pedidos_guardados = [p for p in pedidos_guardados if p.get("id") != id_pedido]
-    guardar_en_archivo()
-    return jsonify({"mensaje": "Pedido eliminado"}), 200
+        pedidos_collection.delete_one({"id": id_pedido})
+        return jsonify({"mensaje": "Pedido eliminado"}), 200
+    return jsonify({"error": "Pedido no encontrado"}), 404
 
-@app.route("/api/pedidos", methods=["POST"])
-def crear_pedido():
-    data = request.get_json()
-    data["timestamp"] = datetime.now().isoformat()
-    data["id"] = generar_id_numerico()
-    pedidos_guardados.append(data)
-    guardar_en_archivo()
-    return jsonify({"mensaje": "Pedido creado", "pedido": data}), 201
-
+# WhatsApp Bot
 estado_usuario = {}
 
 PLATOS = {
@@ -113,7 +103,6 @@ PLATOS = {
     "9": "Ensalada Caprese",
     "10": "Saltimbocca alla Romana"
 }
-
 LISTADO_PRODUCTOS = "\n".join([f"{n}. {nombre}" for n, nombre in PLATOS.items()])
 
 @app.route('/bot', methods=['POST'])
@@ -179,8 +168,7 @@ def bot():
                 "productos": [],
                 "timestamp": datetime.now().isoformat()
             }
-            pedidos_guardados.append(payload)
-            guardar_en_archivo()
+            pedidos_collection.insert_one(payload)
             msg.body(
                 f"✅ ¡Reserva confirmada!\n\n"
                 f"📌 Nombre: {usuario['nombre']}\n"
@@ -197,16 +185,10 @@ def bot():
             )
 
     elif usuario["fase"] == "esperando_productos":
-        from collections import Counter
         numeros = [n.strip() for n in mensaje.split(",")]
         cantidades = Counter(numeros)
-        productos = []
-        for num, cant in cantidades.items():
-            nombre = PLATOS.get(num)
-            if nombre:
-                productos.append(f"{nombre} (x{cant})")
+        productos = [f"{PLATOS.get(n)} (x{cant})" for n, cant in cantidades.items() if PLATOS.get(n)]
         usuario["productos"] = productos
-
         payload = {
             "id": generar_id_numerico(),
             "telefono": from_numero,
@@ -217,8 +199,7 @@ def bot():
             "timestamp": datetime.now().isoformat(),
             "estado": "pendiente"
         }
-        pedidos_guardados.append(payload)
-        guardar_en_archivo()
+        pedidos_collection.insert_one(payload)
         msg.body(
             f"✅ ¡Pedido para llevar confirmado!\n\n"
             f"📌 Nombre: {usuario['nombre']}\n"
@@ -234,4 +215,3 @@ def bot():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
-
